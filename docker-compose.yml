@@ -1,0 +1,531 @@
+version: '3.9'
+
+# ============================================================================
+# LesCopains - Docker Compose Production
+# ============================================================================
+# Architecture complète avec mises à jour automatiques
+# Toutes les variables d'environnement sont définies inline (pas de fichier .env)
+# ============================================================================
+
+services:
+  # ==========================================================================
+  # REVERSE PROXY - Caddy 2.8 (HTTP/3 + Auto-HTTPS)
+  # ==========================================================================
+  caddy:
+    image: caddy:2.8-alpine
+    container_name: lescopains-caddy
+    pull_policy: always # Force pull de la dernière image à chaque up/restart
+    restart: unless-stopped
+    ports:
+      - "80:80"       # HTTP (redirect vers HTTPS)
+      - "443:443"     # HTTPS
+      - "443:443/udp" # HTTP/3 (QUIC)
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      - web
+    environment:
+      # Domaine principal - MODIFIER ICI
+      DOMAIN: lescopains.example.com
+      # Email pour Let's Encrypt
+      ACME_EMAIL: admin@example.com
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:80/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    depends_on:
+      backend:
+        condition: service_healthy
+      frontend:
+        condition: service_started
+      signaling:
+        condition: service_started
+
+  # ==========================================================================
+  # BACKEND API - Node.js 22 + Fastify + TypeScript
+  # ==========================================================================
+  backend:
+    image: ghcr.io/lescopains/backend:latest
+    container_name: lescopains-backend
+    pull_policy: always
+    restart: unless-stopped
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      args:
+        NODE_VERSION: 22-alpine
+    ports:
+      - "3000:3000" # Expose uniquement pour debug, Caddy fait le proxy
+    networks:
+      - web
+      - internal
+    environment:
+      # ===== Application =====
+      NODE_ENV: production
+      PORT: 3000
+      LOG_LEVEL: info
+      
+      # ===== Base de données =====
+      DATABASE_URL: postgresql://lescopains:CHANGE_ME_STRONG_PASSWORD_DB@postgres:5432/lescopains?sslmode=disable
+      DATABASE_POOL_MIN: 2
+      DATABASE_POOL_MAX: 20
+      
+      # ===== Redis (cache & présence) =====
+      REDIS_URL: redis://redis:6379
+      REDIS_PASSWORD: CHANGE_ME_STRONG_PASSWORD_REDIS
+      
+      # ===== JWT Authentication =====
+      JWT_SECRET: CHANGE_ME_STRONG_JWT_SECRET_MIN_32_CHARS_RANDOM
+      JWT_ACCESS_EXPIRY: 15m
+      JWT_REFRESH_EXPIRY: 7d
+      
+      # ===== Chiffrement E2EE =====
+      # Serveur ne stocke que ciphertext, mais signature serveur pour anti-replay
+      SERVER_SIGNING_KEY: CHANGE_ME_SERVER_SIGNING_KEY_BASE64
+      
+      # ===== CORS =====
+      CORS_ORIGIN: https://lescopains.example.com
+      
+      # ===== Rate Limiting =====
+      RATE_LIMIT_MAX: 100
+      RATE_LIMIT_WINDOW: 60000 # 1 minute en ms
+      
+      # ===== Upload fichiers =====
+      MAX_FILE_SIZE: 10485760 # 10MB
+      UPLOAD_DIR: /app/uploads
+      
+      # ===== URLs internes =====
+      SIGNALING_URL: http://signaling:3001
+      MEDIASOUP_URL: http://mediasoup:3003
+    volumes:
+      - uploads:/app/uploads
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:3000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # ==========================================================================
+  # SIGNALING - Socket.IO + WebRTC Signaling
+  # ==========================================================================
+  signaling:
+    image: ghcr.io/lescopains/signaling:latest
+    container_name: lescopains-signaling
+    pull_policy: always
+    restart: unless-stopped
+    build:
+      context: ./signaling
+      dockerfile: Dockerfile
+      args:
+        NODE_VERSION: 22-alpine
+    ports:
+      - "3001:3001"
+    networks:
+      - web
+      - internal
+    environment:
+      # ===== Application =====
+      NODE_ENV: production
+      PORT: 3001
+      LOG_LEVEL: info
+      
+      # ===== Redis (Socket.IO adapter pour multi-instances) =====
+      REDIS_URL: redis://redis:6379
+      REDIS_PASSWORD: CHANGE_ME_STRONG_PASSWORD_REDIS
+      
+      # ===== Database (lecture seule pour auth) =====
+      DATABASE_URL: postgresql://lescopains:CHANGE_ME_STRONG_PASSWORD_DB@postgres:5432/lescopains?sslmode=disable
+      
+      # ===== JWT (validation tokens) =====
+      JWT_SECRET: CHANGE_ME_STRONG_JWT_SECRET_MIN_32_CHARS_RANDOM
+      
+      # ===== WebSocket =====
+      WS_PATH: /ws
+      WS_CORS_ORIGIN: https://lescopains.example.com
+      WS_PING_INTERVAL: 30000
+      WS_PING_TIMEOUT: 60000
+      
+      # ===== Présence =====
+      PRESENCE_TTL: 60 # Secondes avant offline
+      
+      # ===== mediasoup SFU =====
+      MEDIASOUP_URL: http://mediasoup:3003
+      MEDIASOUP_INTERNAL_IP: mediasoup
+      
+      # ===== WebRTC =====
+      # Adresse IP publique du serveur pour ICE candidates (MODIFIER ICI)
+      RTC_ANNOUNCED_IP: YOUR_PUBLIC_IP_HERE
+      RTC_MIN_PORT: 40000
+      RTC_MAX_PORT: 40100
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:3001/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+
+  # ==========================================================================
+  # MEDIASOUP SFU - WebRTC Media Server
+  # ==========================================================================
+  mediasoup:
+    image: ghcr.io/lescopains/mediasoup:latest
+    container_name: lescopains-mediasoup
+    pull_policy: always
+    restart: unless-stopped
+    build:
+      context: ./mediasoup
+      dockerfile: Dockerfile
+      args:
+        NODE_VERSION: 22-alpine
+    ports:
+      - "3003:3003"
+      # Range de ports pour WebRTC (RTP/RTCP)
+      - "40000-40100:40000-40100/udp"
+      - "40000-40100:40000-40100/tcp"
+    networks:
+      - internal
+    environment:
+      # ===== Application =====
+      NODE_ENV: production
+      PORT: 3003
+      LOG_LEVEL: warn # mediasoup est verbeux, warn suffit
+      
+      # ===== mediasoup Workers =====
+      MEDIASOUP_NUM_WORKERS: 2 # Auto-détecte CPU cores si pas défini
+      MEDIASOUP_LOG_LEVEL: warn
+      
+      # ===== WebRTC Settings =====
+      MEDIASOUP_LISTEN_IP: 0.0.0.0
+      MEDIASOUP_ANNOUNCED_IP: YOUR_PUBLIC_IP_HERE # Même IP que signaling
+      MEDIASOUP_MIN_PORT: 40000
+      MEDIASOUP_MAX_PORT: 40100
+      
+      # ===== Codecs Audio =====
+      ENABLE_OPUS: "true"
+      OPUS_MAX_PLAYBACK_RATE: 48000
+      OPUS_STEREO: "true"
+      
+      # ===== Codecs Vidéo =====
+      ENABLE_VP8: "true"
+      ENABLE_VP9: "true"
+      ENABLE_H264: "true"
+      
+      # ===== Simulcast (adaptive bitrate) =====
+      ENABLE_SIMULCAST: "true"
+      
+      # ===== Limites par Room =====
+      MAX_PARTICIPANTS_PER_ROOM: 50
+      MAX_VIDEO_PRODUCERS_PER_USER: 2 # Caméra + partage écran
+      
+      # ===== Redis (coordination multi-workers) =====
+      REDIS_URL: redis://redis:6379
+      REDIS_PASSWORD: CHANGE_ME_STRONG_PASSWORD_REDIS
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:3003/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  # ==========================================================================
+  # FRONTEND - SvelteKit SSR/SPA
+  # ==========================================================================
+  frontend:
+    image: ghcr.io/lescopains/frontend:latest
+    container_name: lescopains-frontend
+    pull_policy: always
+    restart: unless-stopped
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        NODE_VERSION: 22-alpine
+    ports:
+      - "3002:3002"
+    networks:
+      - web
+    environment:
+      # ===== Application =====
+      NODE_ENV: production
+      PORT: 3002
+      
+      # ===== URLs publiques (utilisées côté client) =====
+      PUBLIC_API_URL: https://lescopains.example.com/api
+      PUBLIC_WS_URL: wss://lescopains.example.com/ws
+      
+      # ===== Feature flags =====
+      PUBLIC_ENABLE_E2EE: "true"
+      PUBLIC_ENABLE_VOICE: "true"
+      PUBLIC_ENABLE_VIDEO: "true"
+      PUBLIC_ENABLE_SCREEN_SHARE: "true"
+      
+      # ===== Analytics (optionnel) =====
+      PUBLIC_ANALYTICS_ENABLED: "false"
+      
+      # ===== Build optimization =====
+      VITE_COMPRESS: "true"
+      VITE_MINIFY: "true"
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:3002"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  # ==========================================================================
+  # DATABASE - PostgreSQL 17
+  # ==========================================================================
+  postgres:
+    image: postgres:17-alpine
+    container_name: lescopains-postgres
+    pull_policy: always
+    restart: unless-stopped
+    networks:
+      - internal
+    environment:
+      # ===== Credentials =====
+      POSTGRES_USER: lescopains
+      POSTGRES_PASSWORD: CHANGE_ME_STRONG_PASSWORD_DB
+      POSTGRES_DB: lescopains
+      
+      # ===== Performance Tuning =====
+      POSTGRES_INITDB_ARGS: --encoding=UTF8 --locale=C
+      # Shared buffers = 25% RAM (pour serveur 4GB)
+      POSTGRES_SHARED_BUFFERS: 1GB
+      POSTGRES_EFFECTIVE_CACHE_SIZE: 3GB
+      POSTGRES_MAINTENANCE_WORK_MEM: 256MB
+      POSTGRES_CHECKPOINT_COMPLETION_TARGET: 0.9
+      POSTGRES_WAL_BUFFERS: 16MB
+      POSTGRES_DEFAULT_STATISTICS_TARGET: 100
+      POSTGRES_RANDOM_PAGE_COST: 1.1 # SSD
+      POSTGRES_EFFECTIVE_IO_CONCURRENCY: 200
+      POSTGRES_WORK_MEM: 5MB
+      POSTGRES_MIN_WAL_SIZE: 1GB
+      POSTGRES_MAX_WAL_SIZE: 4GB
+      POSTGRES_MAX_CONNECTIONS: 100
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro # Scripts d'initialisation
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lescopains -d lescopains"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    command:
+      - postgres
+      - -c
+      - shared_buffers=1GB
+      - -c
+      - effective_cache_size=3GB
+      - -c
+      - maintenance_work_mem=256MB
+      - -c
+      - checkpoint_completion_target=0.9
+      - -c
+      - wal_buffers=16MB
+      - -c
+      - default_statistics_target=100
+      - -c
+      - random_page_cost=1.1
+      - -c
+      - effective_io_concurrency=200
+      - -c
+      - work_mem=5242kB
+      - -c
+      - min_wal_size=1GB
+      - -c
+      - max_wal_size=4GB
+      - -c
+      - max_connections=100
+      - -c
+      - log_statement=none # Éviter de logger les queries (sécurité E2EE)
+      - -c
+      - log_duration=off
+
+  # ==========================================================================
+  # CACHE - Redis 7.4
+  # ==========================================================================
+  redis:
+    image: redis:7.4-alpine
+    container_name: lescopains-redis
+    pull_policy: always
+    restart: unless-stopped
+    networks:
+      - internal
+    environment:
+      # Redis n'utilise pas de variables d'env, config via command
+      REDIS_PASSWORD: CHANGE_ME_STRONG_PASSWORD_REDIS
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "--raw", "incr", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    command:
+      - redis-server
+      - --requirepass
+      - CHANGE_ME_STRONG_PASSWORD_REDIS
+      - --maxmemory
+      - 512mb
+      - --maxmemory-policy
+      - allkeys-lru # Éviction LRU si mémoire pleine
+      - --appendonly
+      - "yes" # Persistence AOF
+      - --appendfsync
+      - everysec
+      - --save
+      - "900 1" # Snapshot toutes les 15min si ≥1 modification
+      - --save
+      - "300 10"
+      - --save
+      - "60 10000"
+
+  # ==========================================================================
+  # WATCHTOWER - Mises à jour automatiques (OPTIONNEL)
+  # ==========================================================================
+  # Décommenter pour activer les mises à jour automatiques sans redémarrage manuel
+  # Attention : Peut causer des interruptions de service
+  
+  # watchtower:
+  #   image: containrrr/watchtower:latest
+  #   container_name: lescopains-watchtower
+  #   pull_policy: always
+  #   restart: unless-stopped
+  #   volumes:
+  #     - /var/run/docker.sock:/var/run/docker.sock
+  #   environment:
+  #     # Vérification toutes les heures
+  #     WATCHTOWER_POLL_INTERVAL: 3600
+  #     # Nettoyer les anciennes images
+  #     WATCHTOWER_CLEANUP: "true"
+  #     # Inclure les containers arrêtés
+  #     WATCHTOWER_INCLUDE_STOPPED: "true"
+  #     # Notification (optionnel)
+  #     # WATCHTOWER_NOTIFICATIONS: email
+  #     # WATCHTOWER_NOTIFICATION_EMAIL_FROM: watchtower@example.com
+  #     # WATCHTOWER_NOTIFICATION_EMAIL_TO: admin@example.com
+  #     # WATCHTOWER_NOTIFICATION_EMAIL_SERVER: smtp.example.com
+  #     # WATCHTOWER_NOTIFICATION_EMAIL_SERVER_PORT: 587
+  #     # Monitoring uniquement (ne pas redémarrer)
+  #     WATCHTOWER_MONITOR_ONLY: "false"
+  #     # Log level
+  #     WATCHTOWER_LOG_LEVEL: info
+  #   networks:
+  #     - internal
+
+# ==============================================================================
+# VOLUMES PERSISTANTS
+# ==============================================================================
+volumes:
+  postgres_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ./data/postgres
+  
+  redis_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ./data/redis
+  
+  uploads:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ./data/uploads
+  
+  caddy_data:
+    driver: local
+  
+  caddy_config:
+    driver: local
+
+# ==============================================================================
+# RÉSEAUX
+# ==============================================================================
+networks:
+  # Réseau externe (accessible depuis Caddy)
+  web:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+  
+  # Réseau interne (services backend uniquement)
+  internal:
+    driver: bridge
+    internal: true # Pas d'accès internet direct
+    ipam:
+      config:
+        - subnet: 172.21.0.0/16
+
+# ==============================================================================
+# INSTRUCTIONS DE DÉPLOIEMENT
+# ==============================================================================
+# 1. AVANT LE PREMIER DÉMARRAGE :
+#    - Créer les dossiers de données :
+#      mkdir -p data/{postgres,redis,uploads}
+#    
+#    - MODIFIER LES VARIABLES :
+#      * DOMAIN (ligne 31)
+#      * ACME_EMAIL (ligne 33)
+#      * Tous les mots de passe CHANGE_ME_*
+#      * RTC_ANNOUNCED_IP (lignes 156 et 213) avec votre IP publique
+#
+# 2. GÉNÉRER DES SECRETS FORTS :
+#    JWT_SECRET=$(openssl rand -base64 32)
+#    SERVER_SIGNING_KEY=$(openssl rand -base64 32)
+#    DB_PASSWORD=$(openssl rand -base64 24)
+#    REDIS_PASSWORD=$(openssl rand -base64 24)
+#
+# 3. DÉMARRER :
+#    docker compose up -d
+#
+# 4. VÉRIFIER :
+#    docker compose ps
+#    docker compose logs -f
+#    curl https://lescopains.example.com/health
+#
+# 5. MISES À JOUR :
+#    Automatique grâce à pull_policy: always
+#    Au redémarrage : docker compose down && docker compose up -d
+#    Ou avec Watchtower : décommenter le service (lignes 276-304)
+#
+# 6. MONITORING :
+#    docker compose logs -f [service]
+#    docker stats
+#
+# 7. BACKUP :
+#    docker compose exec postgres pg_dump -U lescopains lescopains > backup.sql
+#    tar -czf backup.tar.gz data/
+#
+# ==============================================================================

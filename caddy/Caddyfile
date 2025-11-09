@@ -1,0 +1,144 @@
+# ==============================================================================
+# Caddyfile - LesCopains Reverse Proxy
+# ==============================================================================
+# HTTP/3 automatique, auto-HTTPS via Let's Encrypt
+# ==============================================================================
+
+{
+    # Configuration globale
+    email {$ACME_EMAIL}
+    
+    # Activer HTTP/3
+    servers {
+        protocols h1 h2 h3
+    }
+    
+    # Log structuré
+    log {
+        output stdout
+        format json
+        level INFO
+    }
+}
+
+# ==============================================================================
+# Site Principal
+# ==============================================================================
+
+{$DOMAIN} {
+    # Headers de sécurité
+    header {
+        # HSTS
+        Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+        
+        # Empêcher MIME sniffing
+        X-Content-Type-Options "nosniff"
+        
+        # Clickjacking protection
+        X-Frame-Options "DENY"
+        
+        # XSS Protection (legacy mais utile)
+        X-XSS-Protection "1; mode=block"
+        
+        # Referrer Policy
+        Referrer-Policy "strict-origin-when-cross-origin"
+        
+        # Permissions Policy (anciennement Feature Policy)
+        Permissions-Policy "camera=(), microphone=(), geolocation=()"
+        
+        # CSP - À adapter selon vos besoins
+        Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; connect-src 'self' wss://{$DOMAIN}; font-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none';"
+        
+        # Retirer headers révélateurs
+        -Server
+        -X-Powered-By
+    }
+    
+    # Compression (gzip + zstd)
+    encode gzip zstd
+    
+    # ===========================================================================
+    # ROUTES
+    # ===========================================================================
+    
+    # Backend API
+    handle /api/* {
+        reverse_proxy backend:3000 {
+            # Health checks
+            health_uri /health
+            health_interval 10s
+            health_timeout 5s
+            
+            # Headers
+            header_up X-Real-IP {remote_host}
+            header_up X-Forwarded-For {remote_host}
+            header_up X-Forwarded-Proto {scheme}
+            
+            # Timeouts
+            transport http {
+                dial_timeout 5s
+                response_header_timeout 30s
+            }
+        }
+    }
+    
+    # WebSocket Signaling
+    handle /ws/* {
+        reverse_proxy signaling:3001 {
+            # WebSocket support
+            transport http {
+                # Pas de timeout pour WebSocket
+                read_buffer 4096
+                write_buffer 4096
+            }
+            
+            # Headers WebSocket
+            header_up Upgrade {>Upgrade}
+            header_up Connection {>Connection}
+            header_up X-Real-IP {remote_host}
+            header_up X-Forwarded-For {remote_host}
+        }
+    }
+    
+    # Frontend SPA
+    handle /* {
+        reverse_proxy frontend:3002 {
+            # Health check
+            health_uri /
+            health_interval 30s
+            health_timeout 10s
+            
+            # Headers
+            header_up X-Real-IP {remote_host}
+            header_up X-Forwarded-For {remote_host}
+            header_up X-Forwarded-Proto {scheme}
+        }
+    }
+    
+    # ===========================================================================
+    # LOGS
+    # ===========================================================================
+    
+    log {
+        output file /var/log/caddy/access.log {
+            roll_size 100mb
+            roll_keep 10
+            roll_keep_for 720h
+        }
+        format json
+        level INFO
+    }
+}
+
+# ==============================================================================
+# Health Check Endpoint (HTTP uniquement, port 80)
+# ==============================================================================
+
+:80 {
+    handle /health {
+        respond "OK" 200
+    }
+    
+    # Redirect tout le reste vers HTTPS
+    redir https://{$DOMAIN}{uri} permanent
+}

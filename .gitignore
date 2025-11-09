@@ -1,0 +1,89 @@
+# ==============================================================================
+# LesCopains .gitignore
+# ==============================================================================
+
+# Données sensibles
+.env
+.env.*
+!.env.example
+.secrets
+*.pem
+*.key
+*.crt
+
+# Données locales
+data/
+uploads/
+logs/
+*.log
+
+# Node.js
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+dist/
+build/
+.cache/
+*.tsbuildinfo
+
+# TypeScript
+*.js.map
+*.d.ts.map
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Docker
+.dockerignore
+docker-compose.override.yml
+
+# Caddy
+caddy_data/
+caddy_config/
+caddy/access.log
+caddy/error.log
+
+# PostgreSQL
+*.sql
+*.dump
+pg_data/
+
+# Redis
+dump.rdb
+appendonly.aof
+
+# Backups
+backup/
+backups/
+*.tar.gz
+*.zip
+*.bak
+
+# Testing
+coverage/
+.nyc_output/
+test-results/
+
+# OS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Temporary
+tmp/
+temp/
+*.tmp
+*.temp
